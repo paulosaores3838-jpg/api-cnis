@@ -5,8 +5,16 @@ import tempfile
 import os
 from pydantic import BaseModel
 from typing import Optional, List
+from supabase import create_client, Client
 
-app = FastAPI(title="API CNIS", version="0.1.0")
+app = FastAPI(title="API CNIS", version="0.2.0")
+
+# Configuração Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Modelo de resposta
 class Vinculo(BaseModel):
@@ -25,6 +33,7 @@ class CnisResponse(BaseModel):
     success: bool
     vinculos: List[Vinculo] = []
     error: Optional[str] = None
+    saved: bool = False
 
 def extrair_texto_pdf(caminho_arquivo):
     texto = ""
@@ -48,7 +57,6 @@ def parsear_vinculos_cnis(texto):
             continue
 
         if padrao_inicio.match(linha):
-            # Linha anterior pode conter "Empregado ou"
             tipo_filiado = ""
             if i > 0:
                 anterior = linhas[i-1].strip()
@@ -61,7 +69,6 @@ def parsear_vinculos_cnis(texto):
                 nit = partes[1]
                 codigo_empregador = partes[2]
 
-                # Encontra datas
                 padrao_data = re.compile(r'\d{2}/\d{2}/\d{4}')
                 datas = padrao_data.findall(linha)
                 if len(datas) >= 2:
@@ -70,22 +77,19 @@ def parsear_vinculos_cnis(texto):
                 else:
                     data_inicio = data_fim = ""
 
-                # Empregador: entre código e data início
                 match_emp = re.search(rf'{codigo_empregador}\s+(.*?)\s+{data_inicio}', linha)
                 empregador = match_emp.group(1).strip() if match_emp else "Não identificado"
 
-                # Resto após data fim
                 resto = linha.split(data_fim)[-1].strip() if data_fim else ""
                 match_resto = re.search(r'(\d{2}/\d{4})\s+(\S+)', resto)
                 ultima_remuneracao = match_resto.group(1) if match_resto else ""
                 indicador = match_resto.group(2) if match_resto else resto
 
-                # Linha seguinte pode conter "Agente Pblico"
                 if i+1 < len(linhas):
                     proxima = linhas[i+1].strip()
                     if "Agente" in proxima:
                         tipo_filiado += proxima
-                        i += 1  # Pula a linha
+                        i += 1
 
                 vinculos.append(Vinculo(
                     sequencia=sequencia,
@@ -120,10 +124,33 @@ async def upload_cnis(file: UploadFile = File(...)):
                 error="Não foi possível extrair texto. PDF pode ser escaneado."
             )
         vinculos = parsear_vinculos_cnis(texto)
+
+        # Se o Supabase estiver configurado, salva os vínculos
+        saved = False
+        if supabase:
+            try:
+                for v in vinculos:
+                    supabase.table("vinculos").insert({
+                        "filename": file.filename,
+                        "sequencia": v.sequencia,
+                        "nit": v.nit,
+                        "codigo_empregador": v.codigo_empregador,
+                        "empregador": v.empregador,
+                        "data_inicio": v.data_inicio,
+                        "data_fim": v.data_fim,
+                        "tipo_filiado": v.tipo_filiado,
+                        "ultima_remuneracao": v.ultima_remuneracao,
+                        "indicador": v.indicador
+                    }).execute()
+                saved = True
+            except Exception as e:
+                print(f"Erro ao salvar no Supabase: {e}")
+
         return CnisResponse(
             filename=file.filename,
             success=True,
-            vinculos=vinculos
+            vinculos=vinculos,
+            saved=saved
         )
     except Exception as e:
         return CnisResponse(
