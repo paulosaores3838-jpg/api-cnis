@@ -5,17 +5,16 @@ import pdfplumber
 import re
 import tempfile
 import os
-import base64
+import json
 from datetime import datetime, date
 from supabase import create_client, Client
 import pytesseract
 from PIL import Image
 import fitz  # PyMuPDF
 import requests
-import json
 
 # ========== CONFIGURAÇÃO ==========
-app = FastAPI(title="API Previdenciária Completa", version="1.0.0")
+app = FastAPI(title="API Previdenciária Completa", version="1.1.0")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
@@ -23,11 +22,12 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Configurações de IA (opcional)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Configurações de IA (agora usando variáveis genéricas)
+LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+LLM_API_BASE = os.getenv("LLM_API_BASE", "https://api.openai.com/v1")  # Padrão: OpenAI, mas vamos usar Gemini nas env
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
-# Caminho do Tesseract (opcional, se não estiver no PATH)
+# Caminho do Tesseract (opcional)
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "tesseract")
 
 # ========== MODELOS ==========
@@ -263,7 +263,6 @@ def calcular_tempo_especial(vinculos):
     tempo_especial_dias = 0
     for v in vinculos:
         if v.indicador and ("ESPECIAL" in v.indicador.upper() or "INDPEND" in v.indicador.upper()):
-            # Assumimos que todo o período do vínculo foi especial (simplificação)
             if v.data_inicio:
                 di = parse_data(v.data_inicio)
                 df = parse_data(v.data_fim) if v.data_fim else date.today()
@@ -276,7 +275,6 @@ def calcular_tempo_especial(vinculos):
 
 def simular_aposentadorias(idade, tempo_anos_total, carencia_meses, sexo):
     sim = {}
-    # Por idade
     idade_minima = 65 if sexo == "M" else 62
     sim["aposentadoria_idade"] = {
         "idade_atual": idade,
@@ -285,14 +283,12 @@ def simular_aposentadorias(idade, tempo_anos_total, carencia_meses, sexo):
         "carencia_necessaria": 180,
         "elegivel": (idade >= idade_minima and carencia_meses >= 180)
     }
-    # Por tempo
     tempo_necessario = 35 if sexo == "M" else 30
     sim["aposentadoria_tempo"] = {
         "tempo_atual_anos": round(tempo_anos_total, 2),
         "tempo_necessario": tempo_necessario,
         "elegivel": (tempo_anos_total >= tempo_necessario)
     }
-    # Pontos (transição)
     pontos_necessarios = 101 if sexo == "M" else 91
     pontos_atuais = idade + tempo_anos_total
     sim["aposentadoria_pontos"] = {
@@ -301,26 +297,21 @@ def simular_aposentadorias(idade, tempo_anos_total, carencia_meses, sexo):
         "elegivel": (pontos_atuais >= pontos_necessarios)
     }
     # Pedágio 50% (simplificado)
-    if sexo == "M":
-        pedagio_necessario = 35
-    else:
-        pedagio_necessario = 30
-    # Implementação simplificada
+    pedagio_necessario = 35 if sexo == "M" else 30
     sim["aposentadoria_pedagio_50"] = {
         "tempo_necessario": pedagio_necessario,
         "tempo_atual": round(tempo_anos_total, 2),
-        "elegivel": (tempo_anos_total >= pedagio_necessario)  # precisa refinamento
+        "elegivel": (tempo_anos_total >= pedagio_necessario)
     }
     return sim
 
-# ========== ANÁLISE COM IA (OPCIONAL) ==========
 def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
-    """Usa OpenAI para extrair dados estruturados de documentos previdenciários."""
-    if not OPENAI_API_KEY:
-        return {"erro": "Chave OpenAI não configurada"}
+    """Usa IA (Gemini, OpenAI ou DeepSeek) para extrair dados estruturados."""
+    if not LLM_API_KEY:
+        return {"erro": "Chave de API de IA não configurada. Configure LLM_API_KEY."}
     try:
         headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Authorization": f"Bearer {LLM_API_KEY}",
             "Content-Type": "application/json"
         }
         prompt = f"""
@@ -331,14 +322,18 @@ def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
         Retorne apenas JSON válido, sem texto adicional.
         """
         payload = {
-            "model": OPENAI_MODEL,
+            "model": LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1
         }
-        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        response = requests.post(
+            f"{LLM_API_BASE.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
         if response.status_code == 200:
             content = response.json()["choices"][0]["message"]["content"]
-            # Tenta parsear JSON
             try:
                 return json.loads(content)
             except:
@@ -362,7 +357,7 @@ async def upload_cnis(file: UploadFile = File(...)):
     try:
         texto = extrair_texto_pdf(caminho)
         if not texto:
-            texto = extrair_texto_pdf_ocr(caminho)  # fallback para OCR
+            texto = extrair_texto_pdf_ocr(caminho)
         if not texto:
             return CnisResponse(
                 filename=file.filename,
@@ -453,7 +448,6 @@ async def calcular(request: CalcularRequest):
         idade = calcular_idade(segurado.get("data_nascimento"))
         total_dias, anos, meses, dias = calcular_tempo(lista_vinculos)
         carencia = calcular_carencia(lista_vinculos)
-        anos_especiais, meses_especiais, dias_especiais = calcular_tempo_especial(lista_vinculos)
 
         tempo_anos_total = anos + (meses / 12) + (dias / 365)
         simulacao = simular_aposentadorias(idade, tempo_anos_total, carencia, sexo)
@@ -472,7 +466,6 @@ async def calcular(request: CalcularRequest):
 
 @app.post("/analisar-documento", response_model=DocumentoAnaliseResponse)
 async def analisar_documento(request: DocumentoAnaliseRequest):
-    """Recebe texto bruto de um documento e usa IA para extrair dados."""
     if not request.texto_bruto:
         return DocumentoAnaliseResponse(success=False, error="texto_bruto é obrigatório")
 
@@ -486,14 +479,9 @@ async def analisar_documento(request: DocumentoAnaliseRequest):
 
 @app.get("/consultar-processo", response_model=ProcessoConsultaResponse)
 async def consultar_processo(protocolo: str = None, nit: str = None):
-    """
-    Endpoint de simulação de consulta processual no Meu INSS.
-    Futuramente será integrado com automação real (RPA).
-    """
     if not protocolo and not nit:
         return ProcessoConsultaResponse(success=False, error="Informe protocolo ou NIT")
 
-    # Dados mockados para teste
     return ProcessoConsultaResponse(
         success=True,
         protocolo=protocolo or "S/N",
