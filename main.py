@@ -10,24 +10,22 @@ from datetime import datetime, date
 from supabase import create_client, Client
 import pytesseract
 from PIL import Image
-import fitz  # PyMuPDF
+import pymupdf  # PyMuPDF
 import requests
 
-# ========== CONFIGURAÇÃO ==========
-app = FastAPI(title="API Previdenciária Completa", version="1.1.0")
+app = FastAPI(title="API Previdenciária Completa", version="1.3.0")
 
+# ========== CONFIGURAÇÃO ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Configurações de IA (agora usando variáveis genéricas)
+# Configurações de IA (agora padrão para Gemini)
 LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-LLM_API_BASE = os.getenv("LLM_API_BASE", "https://api.openai.com/v1")  # Padrão: OpenAI, mas vamos usar Gemini nas env
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
-# Caminho do Tesseract (opcional)
+LLM_API_BASE = os.getenv("LLM_API_BASE", "https://generativelanguage.googleapis.com/v1beta/openai")
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-flash-latest")
 TESSERACT_CMD = os.getenv("TESSERACT_CMD", "tesseract")
 
 # ========== MODELOS ==========
@@ -75,7 +73,7 @@ class CalculoResponse(BaseModel):
 
 class DocumentoAnaliseRequest(BaseModel):
     nit: Optional[str] = None
-    tipo_documento: Optional[str] = None  # ex: "PPP", "LAUDO", "CARTERA"
+    tipo_documento: Optional[str] = None
     texto_bruto: Optional[str] = None
 
 class DocumentoAnaliseResponse(BaseModel):
@@ -92,6 +90,21 @@ class ProcessoConsultaResponse(BaseModel):
     movimentacoes: Optional[List[Dict[str, str]]] = None
     documentos: Optional[List[str]] = None
 
+class ErroDiagnostico(BaseModel):
+    local_do_erro: Optional[str] = None
+    tipo_de_erro: Optional[str] = None
+    descricao: Optional[str] = None
+    como_corrigir: Optional[str] = None
+
+class AuditoriaResponse(BaseModel):
+    success: bool
+    error: Optional[str] = None
+    status_geral: Optional[str] = None
+    servico_detectado: Optional[str] = None
+    segurado: Optional[str] = None
+    diagnostico_erros: List[ErroDiagnostico] = []
+    pontos_aprovados: List[str] = []
+
 # ========== FUNÇÕES AUXILIARES ==========
 def extrair_texto_pdf(caminho_arquivo):
     texto = ""
@@ -103,10 +116,9 @@ def extrair_texto_pdf(caminho_arquivo):
     return texto.strip()
 
 def extrair_texto_pdf_ocr(caminho_arquivo):
-    """Extrai texto de PDF escaneado usando OCR."""
     texto = ""
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-    doc = fitz.open(caminho_arquivo)
+    doc = pymupdf.open(caminho_arquivo)
     for page_num in range(len(doc)):
         page = doc.load_page(page_num)
         pix = page.get_pixmap(dpi=300)
@@ -259,7 +271,6 @@ def calcular_idade(data_nascimento):
     return idade
 
 def calcular_tempo_especial(vinculos):
-    """Simplificação: identifica vínculos com indicador de tempo especial e calcula tempo especial total."""
     tempo_especial_dias = 0
     for v in vinculos:
         if v.indicador and ("ESPECIAL" in v.indicador.upper() or "INDPEND" in v.indicador.upper()):
@@ -296,7 +307,6 @@ def simular_aposentadorias(idade, tempo_anos_total, carencia_meses, sexo):
         "pontos_necessarios": pontos_necessarios,
         "elegivel": (pontos_atuais >= pontos_necessarios)
     }
-    # Pedágio 50% (simplificado)
     pedagio_necessario = 35 if sexo == "M" else 30
     sim["aposentadoria_pedagio_50"] = {
         "tempo_necessario": pedagio_necessario,
@@ -306,9 +316,8 @@ def simular_aposentadorias(idade, tempo_anos_total, carencia_meses, sexo):
     return sim
 
 def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
-    """Usa IA (Gemini, OpenAI ou DeepSeek) para extrair dados estruturados."""
     if not LLM_API_KEY:
-        return {"erro": "Chave de API de IA não configurada. Configure LLM_API_KEY."}
+        return {"erro": "Chave de API de IA não configurada."}
     try:
         headers = {
             "Authorization": f"Bearer {LLM_API_KEY}",
@@ -319,7 +328,7 @@ def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
         Analise o seguinte documento ({tipo_documento}) e extraia os dados relevantes em formato JSON.
         Documento:
         {texto[:4000]}
-        Retorne apenas JSON válido, sem texto adicional.
+        Retorne apenas JSON válido.
         """
         payload = {
             "model": LLM_MODEL,
@@ -342,6 +351,228 @@ def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
             return {"erro": f"Falha na API: {response.status_code}"}
     except Exception as e:
         return {"erro": str(e)}
+
+def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
+    """Usa IA para identificar o tipo de benefício e extrair campos relevantes."""
+    if not LLM_API_KEY:
+        return {"erro": "Chave de API de IA não configurada."}
+    try:
+        headers = {
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        prompt = f"""
+        Você é um auditor previdenciário sênior. Analise o texto abaixo e retorne um JSON com:
+        - tipo_servico: um dos valores: SEGURO_DEFESO, APOSENTADORIA, AUXILIO_INCAPACIDADE, BPC_LOAS, PENSAO_MORTE, OUTRO
+        - segurado: nome do segurado
+        - dados_especificos: um dicionário com os campos mais relevantes para o tipo de serviço identificado.
+        Exemplos de campos por serviço:
+        SEGURO_DEFESO: rgp_data_emissao, rgp_ativo, possui_vinculo_clt, possui_mei, recebe_outro_beneficio, portaria_defeso_vigente
+        APOSENTADORIA: vinculos, tempo_contribuicao_anos, carencia_meses, idade, sexo, indicadores_pendentes
+        AUXILIO_INCAPACIDADE: dii, qualidade_segurado, carencia_meses, laudo_cid, crm_assinatura
+        BPC_LOAS: cadunico_atualizado, renda_per_capita, idade, comprovacao_deficiencia
+        PENSAO_MORTE: qualidade_segurado_obito, relacao_dependencia, data_obito
+        Texto:
+        {texto[:5000]}
+        Retorne APENAS JSON válido, sem texto adicional.
+        """
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1
+        }
+        response = requests.post(
+            f"{LLM_API_BASE.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        if response.status_code == 200:
+            content = response.json()["choices"][0]["message"]["content"]
+            try:
+                return json.loads(content)
+            except:
+                content_clean = content.strip("`").replace("json", "", 1).strip()
+                return json.loads(content_clean)
+        else:
+            return {"erro": f"Falha na API: {response.status_code}"}
+    except Exception as e:
+        return {"erro": str(e)}
+
+# ========== MOTORES DE REGRAS ==========
+def motor_seguro_defeso(dados: Dict[str, Any]) -> AuditoriaResponse:
+    erros = []
+    aprovados = []
+    rgp_data = dados.get("rgp_data_emissao")
+    rgp_ativo = dados.get("rgp_ativo")
+    possui_vinculo = dados.get("possui_vinculo_clt")
+    possui_mei = dados.get("possui_mei")
+    recebe_beneficio = dados.get("recebe_outro_beneficio")
+    portaria = dados.get("portaria_defeso_vigente")
+
+    if rgp_ativo == False:
+        erros.append(ErroDiagnostico(local_do_erro="RGP", tipo_de_erro="RGP inativo ou vencido", descricao="O RGP não está ativo.", como_corrigir="Solicite a regularização do RGP junto ao MPA."))
+    if rgp_data:
+        data_emissao = parse_data(rgp_data)
+        if data_emissao:
+            hoje = date.today()
+            if (hoje - data_emissao).days < 365:
+                erros.append(ErroDiagnostico(local_do_erro="RGP", tipo_de_erro="RGP emitido há menos de 12 meses", descricao="O RGP foi emitido recentemente.", como_corrigir="Se possuir RGP antigo, anexe o histórico. Caso contrário, o pedido será indeferido."))
+        else:
+            erros.append(ErroDiagnostico(local_do_erro="RGP", tipo_de_erro="Data de emissão do RGP não identificada", descricao="Não foi possível identificar a data de emissão do RGP.", como_corrigir="Anexe o RGP legível ou histórico atualizado."))
+    else:
+        erros.append(ErroDiagnostico(local_do_erro="RGP", tipo_de_erro="RGP não informado", descricao="Não foi possível identificar o RGP.", como_corrigir="Anexe o RGP ou histórico do MPA."))
+
+    if possui_vinculo == True:
+        erros.append(ErroDiagnostico(local_do_erro="CNIS", tipo_de_erro="Vínculo CLT ativo", descricao="Existe vínculo CLT ativo, incompatível com o defeso.", como_corrigir="Verifique se o vínculo já foi encerrado; se não, solicite acerto de vínculo no Meu INSS."))
+    if possui_mei == True:
+        erros.append(ErroDiagnostico(local_do_erro="CPF/CNPJ", tipo_de_erro="Pescador possui MEI/CNPJ ativo", descricao="Pescador com MEI ativo pode ser considerado empresário e não elegível.", como_corrigir="Comprove que a atividade é exclusivamente artesanal ou encerre o MEI."))
+    if recebe_beneficio == True:
+        erros.append(ErroDiagnostico(local_do_erro="Benefícios", tipo_de_erro="Acúmulo de benefício incompatível", descricao="Recebimento de outro benefício pode bloquear o defeso.", como_corrigir="Verifique a compatibilidade do benefício com o defeso."))
+    if portaria == False:
+        erros.append(ErroDiagnostico(local_do_erro="Portaria", tipo_de_erro="Defeso não vigente", descricao="A portaria do defeso não está vigente para o período.", como_corrigir="Confirme o período de defeso no site do MPA."))
+    if not erros:
+        aprovados.append("RGP ativo e com mais de 12 meses")
+        aprovados.append("Sem vínculos incompatíveis")
+        aprovados.append("Defeso vigente")
+
+    status = "✅ APROVADO" if not erros else "🟡 RISCO DE INDEFERIMENTO"
+    return AuditoriaResponse(
+        success=True,
+        status_geral=status,
+        servico_detectado="Seguro-Defeso (SDPA)",
+        segurado=dados.get("segurado", "Não identificado"),
+        diagnostico_erros=erros,
+        pontos_aprovados=aprovados
+    )
+
+def motor_aposentadoria(dados: Dict[str, Any]) -> AuditoriaResponse:
+    erros = []
+    aprovados = []
+    indicadores = dados.get("indicadores_pendentes", [])
+    if indicadores:
+        erros.append(ErroDiagnostico(local_do_erro="CNIS", tipo_de_erro="Indicadores de pendência", descricao=f"Indicadores pendentes: {indicadores}", como_corrigir="Anexe documentos para regularizar."))
+    tempo = float(dados.get("tempo_contribuicao_anos", 0) or 0)
+    carencia = int(dados.get("carencia_meses", 0) or 0)
+    sexo = dados.get("sexo", "M")
+    idade = int(dados.get("idade", 0) or 0)
+    if carencia < 180:
+        erros.append(ErroDiagnostico(local_do_erro="Carência", tipo_de_erro="Carência insuficiente", descricao=f"Carência de {carencia} meses, menor que 180.", como_corrigir="Aguarde completar 180 meses ou verifique períodos não computados."))
+    tempo_necessario = 35 if sexo == "M" else 30
+    if tempo < tempo_necessario:
+        erros.append(ErroDiagnostico(local_do_erro="Tempo de contribuição", tipo_de_erro="Tempo abaixo do necessário", descricao=f"Tempo de contribuição de {tempo} anos, abaixo de {tempo_necessario}.", como_corrigir="Verifique vínculos não baixados ou averbação de tempo especial."))
+    if not erros:
+        aprovados.append("Carência e tempo de contribuição atingidos")
+    status = "✅ APROVADO" if not erros else "🟡 RISCO DE INDEFERIMENTO"
+    return AuditoriaResponse(
+        success=True,
+        status_geral=status,
+        servico_detectado="Aposentadoria",
+        segurado=dados.get("segurado", "Não identificado"),
+        diagnostico_erros=erros,
+        pontos_aprovados=aprovados
+    )
+
+def motor_auxilio_incapacidade(dados: Dict[str, Any]) -> AuditoriaResponse:
+    erros = []
+    aprovados = []
+    qualidade = dados.get("qualidade_segurado")
+    carencia = int(dados.get("carencia_meses", 0) or 0)
+    dii = dados.get("dii")
+    laudo_cid = dados.get("laudo_cid")
+    crm = dados.get("crm_assinatura")
+    if qualidade == False:
+        erros.append(ErroDiagnostico(local_do_erro="Qualidade de segurado", tipo_de_erro="Perda da qualidade de segurado", descricao="Não há qualidade de segurado na DII.", como_corrigir="Comprove que a doença começou antes da perda da qualidade."))
+    if carencia < 12:
+        erros.append(ErroDiagnostico(local_do_erro="Carência", tipo_de_erro="Carência insuficiente", descricao=f"Carência de {carencia} meses, menor que 12.", como_corrigir="Verifique se há isenção de carência para a patologia."))
+    if not laudo_cid:
+        erros.append(ErroDiagnostico(local_do_erro="Laudo médico", tipo_de_erro="CID não informado", descricao="O laudo não contém o CID.", como_corrigir="Solicite ao médico laudo com CID."))
+    if not crm:
+        erros.append(ErroDiagnostico(local_do_erro="Laudo médico", tipo_de_erro="Assinatura/CRM ilegível", descricao="CRM ou assinatura não identificados.", como_corrigir="Anexe laudo legível com CRM e assinatura."))
+    if not erros:
+        aprovados.append("Laudo completo e carência cumprida")
+    status = "✅ APROVADO" if not erros else "🟡 RISCO DE INDEFERIMENTO"
+    return AuditoriaResponse(
+        success=True,
+        status_geral=status,
+        servico_detectado="Auxílio-Doença / Incapacidade",
+        segurado=dados.get("segurado", "Não identificado"),
+        diagnostico_erros=erros,
+        pontos_aprovados=aprovados
+    )
+
+def motor_bpc_loas(dados: Dict[str, Any]) -> AuditoriaResponse:
+    erros = []
+    aprovados = []
+    cadunico = dados.get("cadunico_atualizado")
+    renda = float(dados.get("renda_per_capita", 0) or 0)
+    comprovacao_deficiencia = dados.get("comprovacao_deficiencia")
+    if cadunico == False:
+        erros.append(ErroDiagnostico(local_do_erro="CadÚnico", tipo_de_erro="CadÚnico desatualizado", descricao="Cadastro desatualizado há mais de 2 anos.", como_corrigir="Atualize o CadÚnico no CRAS antes de protocolar."))
+    if renda > 0.25:
+        erros.append(ErroDiagnostico(local_do_erro="Renda familiar", tipo_de_erro="Renda per capita acima de 1/4 do salário mínimo", descricao=f"Renda per capita de {renda} salários mínimos.", como_corrigir="Verifique se há despesas dedutíveis ou membros não considerados."))
+    if comprovacao_deficiencia == False:
+        erros.append(ErroDiagnostico(local_do_erro="Deficiência", tipo_de_erro="Impedimento de longo prazo não comprovado", descricao="Laudos insuficientes para PCD.", como_corrigir="Anexe laudos médicos e exames atualizados."))
+    if not erros:
+        aprovados.append("Critérios de renda e cadastro atendidos")
+    status = "✅ APROVADO" if not erros else "🟡 RISCO DE INDEFERIMENTO"
+    return AuditoriaResponse(
+        success=True,
+        status_geral=status,
+        servico_detectado="BPC/LOAS",
+        segurado=dados.get("segurado", "Não identificado"),
+        diagnostico_erros=erros,
+        pontos_aprovados=aprovados
+    )
+
+def motor_pensao_morte(dados: Dict[str, Any]) -> AuditoriaResponse:
+    erros = []
+    aprovados = []
+    qualidade_obito = dados.get("qualidade_segurado_obito")
+    relacao = dados.get("relacao_dependencia")
+    data_obito = dados.get("data_obito")
+    if qualidade_obito == False:
+        erros.append(ErroDiagnostico(local_do_erro="Qualidade de segurado do falecido", tipo_de_erro="Falecido sem qualidade de segurado", descricao="O falecido não tinha qualidade de segurado na data do óbito.", como_corrigir="Comprove contribuições ou manutenção da qualidade."))
+    if not relacao:
+        erros.append(ErroDiagnostico(local_do_erro="Dependência", tipo_de_erro="Dependência não comprovada", descricao="Não foi possível comprovar dependência.", como_corrigir="Anexe documentos que comprovem dependência econômica."))
+    if not data_obito:
+        erros.append(ErroDiagnostico(local_do_erro="Certidão de óbito", tipo_de_erro="Data de óbito não informada", descricao="Data de óbito não identificada.", como_corrigir="Anexe certidão de óbito legível."))
+    if not erros:
+        aprovados.append("Dependência e qualidade de segurado confirmadas")
+    status = "✅ APROVADO" if not erros else "🟡 RISCO DE INDEFERIMENTO"
+    return AuditoriaResponse(
+        success=True,
+        status_geral=status,
+        servico_detectado="Pensão por Morte",
+        segurado=dados.get("segurado", "Não identificado"),
+        diagnostico_erros=erros,
+        pontos_aprovados=aprovados
+    )
+
+def roteador_auditoria(dados_ia: Dict[str, Any]) -> AuditoriaResponse:
+    tipo = dados_ia.get("tipo_servico", "OUTRO").upper()
+    segurado = dados_ia.get("segurado", "Não identificado")
+    especificos = dados_ia.get("dados_especificos", {}) or {}
+
+    if tipo == "SEGURO_DEFESO":
+        return motor_seguro_defeso(especificos)
+    elif tipo == "APOSENTADORIA":
+        return motor_aposentadoria(especificos)
+    elif tipo == "AUXILIO_INCAPACIDADE":
+        return motor_auxilio_incapacidade(especificos)
+    elif tipo == "BPC_LOAS":
+        return motor_bpc_loas(especificos)
+    elif tipo == "PENSAO_MORTE":
+        return motor_pensao_morte(especificos)
+    else:
+        return AuditoriaResponse(
+            success=True,
+            status_geral="⚠️ NÃO FOI POSSÍVEL IDENTIFICAR O TIPO DE BENEFÍCIO",
+            servico_detectado="Desconhecido",
+            segurado=segurado,
+            diagnostico_erros=[ErroDiagnostico(local_do_erro="Identificação", tipo_de_erro="Benefício não identificado", descricao="Não foi possível classificar o serviço.", como_corrigir="Verifique se o documento contém informações suficientes.")],
+            pontos_aprovados=[]
+        )
 
 # ========== ENDPOINTS ==========
 @app.post("/upload-cnis", response_model=CnisResponse)
@@ -493,6 +724,35 @@ async def consultar_processo(protocolo: str = None, nit: str = None):
         ],
         documentos=["Requerimento.pdf", "CNIS.pdf", "Documento_Identidade.pdf"]
     )
+
+@app.post("/auditar-processo", response_model=AuditoriaResponse)
+async def auditar_processo(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Apenas PDF")
+
+    conteudo = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        tmp.write(conteudo)
+        caminho = tmp.name
+
+    try:
+        texto = extrair_texto_pdf(caminho)
+        if not texto:
+            texto = extrair_texto_pdf_ocr(caminho)
+        if not texto:
+            return AuditoriaResponse(success=False, error="Não foi possível extrair texto do PDF.")
+
+        dados_ia = extrair_dados_auditoria_ia(texto)
+        if "erro" in dados_ia:
+            return AuditoriaResponse(success=False, error=dados_ia["erro"])
+
+        resultado = roteador_auditoria(dados_ia)
+        return resultado
+    except Exception as e:
+        return AuditoriaResponse(success=False, error=str(e))
+    finally:
+        if os.path.exists(caminho):
+            os.unlink(caminho)
 
 @app.get("/")
 async def root():
