@@ -15,7 +15,7 @@ st.markdown("---")
 # Menu lateral
 opcao = st.sidebar.radio(
     "Selecione a funcionalidade:",
-    ["Upload CNIS", "Calcular Benefício", "Analisar Documento", "Consulta Processo"]
+    ["Upload CNIS", "Calcular Benefício", "Analisar Documento", "Consulta Processo", "Auditoria de Processo"]
 )
 
 # ========== 1. UPLOAD CNIS ==========
@@ -164,6 +164,44 @@ elif opcao == "Consulta Processo":
                             st.subheader("Documentos")
                             for doc in dados.get("documentos", []):
                                 st.write(f"📎 {doc}")
+                        else:
+                            st.error(f"Erro: {dados.get('error', 'Falha desconhecida')}")
+                    else:
+                        st.error(f"Erro HTTP {resp.status_code}")
+                except Exception as e:
+                    st.error(f"Exceção: {e}")
+
+# ========== 5. AUDITORIA DE PROCESSO ==========
+elif opcao == "Auditoria de Processo":
+    st.header("🩺 Auditoria de Processo")
+    arquivo = st.file_uploader("Envie o PDF do processo", type=["pdf"])
+
+    if arquivo is not None:
+        if st.button("Auditar"):
+            with st.spinner("Analisando processo..."):
+                try:
+                    files = {"file": (arquivo.name, arquivo.getvalue(), "application/pdf")}
+                    resp = requests.post(f"{API_BASE}/auditar-processo", files=files, timeout=90)
+                    if resp.status_code == 200:
+                        dados = resp.json()
+                        if dados.get("success"):
+                            st.success(f"Status: {dados.get('status_geral')}")
+                            st.write(f"**Serviço detectado:** {dados.get('servico_detectado')}")
+                            st.write(f"**Segurado:** {dados.get('segurado')}")
+
+                            st.subheader("🔴 Erros encontrados")
+                            for erro in dados.get("diagnostico_erros", []):
+                                st.markdown(f"""
+                                **Local:** {erro.get('local_do_erro')}  
+                                **Tipo:** {erro.get('tipo_de_erro')}  
+                                **Descrição:** {erro.get('descricao')}  
+                                **Como corrigir:** {erro.get('como_corrigir')}  
+                                ---
+                                """)
+
+                            st.subheader("🟢 Pontos aprovados")
+                            for ponto in dados.get("pontos_aprovados", []):
+                                st.write(f"✔️ {ponto}")
                         else:
                             st.error(f"Erro: {dados.get('error', 'Falha desconhecida')}")
                     else:
