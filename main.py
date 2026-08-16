@@ -768,42 +768,53 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
 
     textos_documentos = []
 
+    # ========== 1. Salvar e extrair texto de TODOS os PDFs ==========
     for file in files:
         if not file.filename.lower().endswith('.pdf'):
             continue
+
+        # Salva em arquivo temporário
         conteudo = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
             tmp.write(conteudo)
-            caminho = tmp.name
+            caminho_temporario = tmp.name
+
         try:
-            texto = extrair_texto_pdf(caminho)
+            # Tenta extrair texto normal (pdfplumber)
+            texto = extrair_texto_pdf(caminho_temporario)
             if not texto:
-                texto = extrair_texto_pdf_ocr(caminho)
+                # Fallback para OCR
+                texto = extrair_texto_pdf_ocr(caminho_temporario)
+
             if texto:
                 textos_documentos.append({
                     "filename": file.filename,
                     "texto": texto
                 })
+            else:
+                print(f"⚠️ Nenhum texto extraído de {file.filename}")
         except Exception as e:
-            print(f"Erro ao processar {file.filename}: {e}")
+            print(f"❌ Erro ao processar {file.filename}: {e}")
         finally:
-            if os.path.exists(caminho):
-                os.unlink(caminho)
+            # Remove o arquivo temporário
+            if os.path.exists(caminho_temporario):
+                os.unlink(caminho_temporario)
 
     if not textos_documentos:
         return ProcessoCompletoResponse(success=False, error="Nenhum texto extraído dos PDFs")
 
+    # ========== 2. Identificar CNIS entre os documentos ==========
     dados_pessoais = None
     vinculos = []
-    cnis_texto = None
 
     for doc in textos_documentos:
+        # Verifica se é CNIS pelo nome ou pelo conteúdo
         if "cnis" in doc["filename"].lower() or "NIT:" in doc["texto"]:
-            cnis_texto = doc["texto"]
-            dados_pessoais = extrair_dados_pessoais(cnis_texto)
-            vinculos = parsear_vinculos_cnis(cnis_texto)
+            dados_pessoais = extrair_dados_pessoais(doc["texto"])
+            vinculos = parsear_vinculos_cnis(doc["texto"])
             break
 
+    # ========== 3. Salvar no Supabase (se CNIS encontrado) ==========
     if supabase and dados_pessoais and dados_pessoais.nit:
         try:
             response_seg = supabase.table("segurados").upsert(
@@ -818,7 +829,9 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
             ).execute()
             if response_seg.data:
                 segurado_id = response_seg.data[0]["id"]
+            # Limpa vínculos antigos
             supabase.table("vinculos").delete().eq("nit", dados_pessoais.nit).execute()
+            # Insere novos vínculos
             for v in vinculos:
                 supabase.table("vinculos").insert({
                     "filename": "processo_completo",
@@ -833,8 +846,9 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
                     "indicador": v.indicador
                 }).execute()
         except Exception as e:
-            print(f"Erro ao salvar: {e}")
+            print(f"Erro ao salvar no Supabase: {e}")
 
+    # ========== 4. Cálculo Previdenciário ==========
     calculo_result = None
     sexo_padrao = "M"
     if dados_pessoais and dados_pessoais.nit:
@@ -861,7 +875,9 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         except Exception as e:
             calculo_result = CalculoResponse(success=False, error=str(e))
 
+    # ========== 5. Auditoria ==========
     auditoria_result = None
+    # Combina os textos de todos os documentos (limitado)
     texto_completo = "\n\n".join([f"=== {doc['filename']} ===\n{doc['texto'][:1500]}" for doc in textos_documentos])
     texto_completo = texto_completo[:6000]
     if LLM_API_KEY and texto_completo:
@@ -871,6 +887,7 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         else:
             auditoria_result = roteador_auditoria(dados_ia)
 
+    # ========== 6. Resposta final ==========
     return ProcessoCompletoResponse(
         success=True,
         dados_pessoais=dados_pessoais,
