@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: api-cnis
+    env: docker
+    plan: free
+    buildCommand: docker build -t app .
+    startCommand: docker run -p 8000:8000 app
