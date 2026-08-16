@@ -132,7 +132,8 @@ if btn_analisar:
         progresso.progress(25)
         status_box.write("🔍 Extraindo dados cadastrais e vínculos (OCR/Parsing)...")
 
-        resp = requests.post(f"{API_BASE}/analisar-processo-completo", files=files, timeout=180)
+        # Timeout aumentado para 300 segundos (5 minutos)
+        resp = requests.post(f"{API_BASE}/analisar-processo-completo", files=files, timeout=300)
         progresso.progress(70)
 
         if resp.status_code == 200:
@@ -292,6 +293,6 @@ if btn_analisar:
             st.error(f"Erro ao conectar com a API: Código {resp.status_code}")
 
     except requests.exceptions.Timeout:
-        st.error("⏳ Tempo limite excedido. Os PDFs enviados são muito pesados para o processamento síncrono.")
+        st.error("⏳ Tempo limite excedido. Os PDFs enviados são muito pesados para o processamento síncrono. Tente enviar menos arquivos ou arquivos menores.")
     except Exception as e:
         st.error(f"⚠️ Ocorreu uma exceção inesperada: {e}")
