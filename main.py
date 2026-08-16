@@ -13,7 +13,7 @@ from PIL import Image
 import pymupdf  # PyMuPDF
 import requests
 
-app = FastAPI(title="API Previdenciária Completa", version="1.4.0")
+app = FastAPI(title="API Previdenciária Completa", version="1.4.1")
 
 # ========== CONFIGURAÇÃO ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -22,7 +22,6 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Configurações de IA (padrão para Gemini)
 LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 LLM_API_BASE = os.getenv("LLM_API_BASE", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-flash-latest")
@@ -130,7 +129,7 @@ def extrair_texto_pdf_ocr(caminho_arquivo):
     doc = pymupdf.open(caminho_arquivo)
     for page_num in range(len(doc)):
         page = doc.load_page(page_num)
-        pix = page.get_pixmap(dpi=300)
+        pix = page.get_pixmap(dpi=200)  # otimizado
         img_path = f"temp_page_{page_num}.png"
         pix.save(img_path)
         img = Image.open(img_path)
@@ -336,7 +335,7 @@ def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
         Você é um assistente especializado em direito previdenciário brasileiro.
         Analise o seguinte documento ({tipo_documento}) e extraia os dados relevantes em formato JSON.
         Documento:
-        {texto[:4000]}
+        {texto[:3000]}
         Retorne apenas JSON válido.
         """
         payload = {
@@ -381,7 +380,7 @@ def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
         BPC_LOAS: cadunico_atualizado, renda_per_capita, idade, comprovacao_deficiencia
         PENSAO_MORTE: qualidade_segurado_obito, relacao_dependencia, data_obito
         Texto:
-        {texto[:5000]}
+        {texto[:3000]}
         Retorne APENAS JSON válido, sem texto adicional.
         """
         payload = {
@@ -769,7 +768,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
 
     textos_documentos = []
 
-    # ========== 1. Extrair texto de todos os PDFs ==========
     for file in files:
         if not file.filename.lower().endswith('.pdf'):
             continue
@@ -795,7 +793,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
     if not textos_documentos:
         return ProcessoCompletoResponse(success=False, error="Nenhum texto extraído dos PDFs")
 
-    # ========== 2. Identificar CNIS entre os documentos ==========
     dados_pessoais = None
     vinculos = []
     cnis_texto = None
@@ -807,9 +804,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
             vinculos = parsear_vinculos_cnis(cnis_texto)
             break
 
-    # ========== 3. Salvar no Supabase (se CNIS encontrado) ==========
-    segurado_id = None
-    saved = False
     if supabase and dados_pessoais and dados_pessoais.nit:
         try:
             response_seg = supabase.table("segurados").upsert(
@@ -824,7 +818,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
             ).execute()
             if response_seg.data:
                 segurado_id = response_seg.data[0]["id"]
-            saved = True
             supabase.table("vinculos").delete().eq("nit", dados_pessoais.nit).execute()
             for v in vinculos:
                 supabase.table("vinculos").insert({
@@ -842,7 +835,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         except Exception as e:
             print(f"Erro ao salvar: {e}")
 
-    # ========== 4. Cálculo Previdenciário ==========
     calculo_result = None
     sexo_padrao = "M"
     if dados_pessoais and dados_pessoais.nit:
@@ -869,9 +861,9 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         except Exception as e:
             calculo_result = CalculoResponse(success=False, error=str(e))
 
-    # ========== 5. Auditoria ==========
     auditoria_result = None
-    texto_completo = "\n\n".join([f"=== {doc['filename']} ===\n{doc['texto']}" for doc in textos_documentos])
+    texto_completo = "\n\n".join([f"=== {doc['filename']} ===\n{doc['texto'][:1500]}" for doc in textos_documentos])
+    texto_completo = texto_completo[:6000]
     if LLM_API_KEY and texto_completo:
         dados_ia = extrair_dados_auditoria_ia(texto_completo)
         if "erro" in dados_ia:
@@ -879,7 +871,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         else:
             auditoria_result = roteador_auditoria(dados_ia)
 
-    # ========== 6. Resposta final ==========
     return ProcessoCompletoResponse(
         success=True,
         dados_pessoais=dados_pessoais,
