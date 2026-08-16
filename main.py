@@ -13,7 +13,7 @@ from PIL import Image
 import pymupdf  # PyMuPDF
 import requests
 
-app = FastAPI(title="API Previdenciária Completa", version="1.3.0")
+app = FastAPI(title="API Previdenciária Completa", version="1.4.0")
 
 # ========== CONFIGURAÇÃO ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -22,7 +22,7 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Configurações de IA (agora padrão para Gemini)
+# Configurações de IA (padrão para Gemini)
 LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 LLM_API_BASE = os.getenv("LLM_API_BASE", "https://generativelanguage.googleapis.com/v1beta/openai")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-flash-latest")
@@ -104,6 +104,15 @@ class AuditoriaResponse(BaseModel):
     segurado: Optional[str] = None
     diagnostico_erros: List[ErroDiagnostico] = []
     pontos_aprovados: List[str] = []
+
+class ProcessoCompletoResponse(BaseModel):
+    success: bool
+    error: Optional[str] = None
+    dados_pessoais: Optional[DadosPessoais] = None
+    vinculos: List[Vinculo] = []
+    calculo: Optional[CalculoResponse] = None
+    auditoria: Optional[AuditoriaResponse] = None
+    documentos_analisados: List[str] = []
 
 # ========== FUNÇÕES AUXILIARES ==========
 def extrair_texto_pdf(caminho_arquivo):
@@ -353,7 +362,6 @@ def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
         return {"erro": str(e)}
 
 def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
-    """Usa IA para identificar o tipo de benefício e extrair campos relevantes."""
     if not LLM_API_KEY:
         return {"erro": "Chave de API de IA não configurada."}
     try:
@@ -753,6 +761,133 @@ async def auditar_processo(file: UploadFile = File(...)):
     finally:
         if os.path.exists(caminho):
             os.unlink(caminho)
+
+@app.post("/analisar-processo-completo", response_model=ProcessoCompletoResponse)
+async def analisar_processo_completo(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="Envie pelo menos um PDF")
+
+    textos_documentos = []
+
+    # ========== 1. Extrair texto de todos os PDFs ==========
+    for file in files:
+        if not file.filename.lower().endswith('.pdf'):
+            continue
+        conteudo = await file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+            tmp.write(conteudo)
+            caminho = tmp.name
+        try:
+            texto = extrair_texto_pdf(caminho)
+            if not texto:
+                texto = extrair_texto_pdf_ocr(caminho)
+            if texto:
+                textos_documentos.append({
+                    "filename": file.filename,
+                    "texto": texto
+                })
+        except Exception as e:
+            print(f"Erro ao processar {file.filename}: {e}")
+        finally:
+            if os.path.exists(caminho):
+                os.unlink(caminho)
+
+    if not textos_documentos:
+        return ProcessoCompletoResponse(success=False, error="Nenhum texto extraído dos PDFs")
+
+    # ========== 2. Identificar CNIS entre os documentos ==========
+    dados_pessoais = None
+    vinculos = []
+    cnis_texto = None
+
+    for doc in textos_documentos:
+        if "cnis" in doc["filename"].lower() or "NIT:" in doc["texto"]:
+            cnis_texto = doc["texto"]
+            dados_pessoais = extrair_dados_pessoais(cnis_texto)
+            vinculos = parsear_vinculos_cnis(cnis_texto)
+            break
+
+    # ========== 3. Salvar no Supabase (se CNIS encontrado) ==========
+    segurado_id = None
+    saved = False
+    if supabase and dados_pessoais and dados_pessoais.nit:
+        try:
+            response_seg = supabase.table("segurados").upsert(
+                {
+                    "nome": dados_pessoais.nome,
+                    "nit": dados_pessoais.nit,
+                    "cpf": dados_pessoais.cpf,
+                    "data_nascimento": dados_pessoais.data_nascimento,
+                    "nome_mae": dados_pessoais.nome_mae,
+                },
+                on_conflict="nit"
+            ).execute()
+            if response_seg.data:
+                segurado_id = response_seg.data[0]["id"]
+            saved = True
+            supabase.table("vinculos").delete().eq("nit", dados_pessoais.nit).execute()
+            for v in vinculos:
+                supabase.table("vinculos").insert({
+                    "filename": "processo_completo",
+                    "sequencia": v.sequencia,
+                    "nit": v.nit,
+                    "codigo_empregador": v.codigo_empregador,
+                    "empregador": v.empregador,
+                    "data_inicio": v.data_inicio,
+                    "data_fim": v.data_fim,
+                    "tipo_filiado": v.tipo_filiado,
+                    "ultima_remuneracao": v.ultima_remuneracao,
+                    "indicador": v.indicador
+                }).execute()
+        except Exception as e:
+            print(f"Erro ao salvar: {e}")
+
+    # ========== 4. Cálculo Previdenciário ==========
+    calculo_result = None
+    sexo_padrao = "M"
+    if dados_pessoais and dados_pessoais.nit:
+        try:
+            if supabase:
+                response_seg = supabase.table("segurados").select("*").eq("nit", dados_pessoais.nit).execute()
+                if response_seg.data:
+                    sexo_padrao = response_seg.data[0].get("sexo") or "M"
+            lista_vinculos = vinculos or []
+            idade = calcular_idade(dados_pessoais.data_nascimento) if dados_pessoais else None
+            total_dias, anos, meses, dias = calcular_tempo(lista_vinculos)
+            carencia = calcular_carencia(lista_vinculos)
+            tempo_anos_total = anos + (meses / 12) + (dias / 365)
+            simulacao = simular_aposentadorias(idade, tempo_anos_total, carencia, sexo_padrao)
+            calculo_result = CalculoResponse(
+                success=True,
+                idade=idade,
+                tempo_contribuicao_anos=anos,
+                tempo_contribuicao_meses=meses,
+                tempo_contribuicao_dias=dias,
+                carencia_meses=carencia,
+                simulacao=simulacao
+            )
+        except Exception as e:
+            calculo_result = CalculoResponse(success=False, error=str(e))
+
+    # ========== 5. Auditoria ==========
+    auditoria_result = None
+    texto_completo = "\n\n".join([f"=== {doc['filename']} ===\n{doc['texto']}" for doc in textos_documentos])
+    if LLM_API_KEY and texto_completo:
+        dados_ia = extrair_dados_auditoria_ia(texto_completo)
+        if "erro" in dados_ia:
+            auditoria_result = AuditoriaResponse(success=False, error=dados_ia["erro"])
+        else:
+            auditoria_result = roteador_auditoria(dados_ia)
+
+    # ========== 6. Resposta final ==========
+    return ProcessoCompletoResponse(
+        success=True,
+        dados_pessoais=dados_pessoais,
+        vinculos=vinculos,
+        calculo=calculo_result,
+        auditoria=auditoria_result,
+        documentos_analisados=[doc["filename"] for doc in textos_documentos],
+    )
 
 @app.get("/")
 async def root():
