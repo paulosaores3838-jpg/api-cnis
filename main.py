@@ -426,34 +426,43 @@ def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
 def extrair_dados_com_ia(texto: str) -> DadosExtraidosIA:
     if not LLM_API_KEY:
         return DadosExtraidosIA(observacoes="Chave de IA não configurada.")
+
     try:
         headers = {
             "Authorization": f"Bearer {LLM_API_KEY}",
             "Content-Type": "application/json"
         }
         prompt = f"""
-        Você é um assistente especializado em análise de documentos pessoais brasileiros (RG, CPF, CTPS, CNIS).
-        Extraia do texto abaixo os seguintes campos, se presentes, e retorne APENAS JSON válido:
+        Você é um assistente especializado em análise de documentos pessoais e previdenciários brasileiros (RG, CPF, CTPS, CNIS, PIS/PASEP).
+        Extraia do texto abaixo TODOS os dados relevantes que encontrar, retornando APENAS JSON válido no seguinte formato:
         {{
-          "nome": "string",
-          "cpf": "string",
-          "nit": "string",
-          "data_nascimento": "dd/mm/aaaa",
-          "nome_mae": "string",
-          "sexo": "M ou F",
+          "nome": "string ou null",
+          "cpf": "string ou null",
+          "nit": "string ou null (pode estar como PIS/PASEP/NIT)",
+          "data_nascimento": "dd/mm/aaaa ou null",
+          "nome_mae": "string ou null",
+          "sexo": "M ou F ou null (inferir pelo nome se necessário)",
           "vinculos": [
             {{
               "empregador": "string",
-              "data_inicio": "dd/mm/aaaa",
-              "data_fim": "dd/mm/aaaa",
-              "cargo": "string",
-              "remuneracao": "string"
+              "cnpj": "string ou null",
+              "cargo": "string ou null",
+              "data_inicio": "dd/mm/aaaa ou null",
+              "data_fim": "dd/mm/aaaa ou null",
+              "remuneracao": "string ou null"
             }}
-          ]
+          ],
+          "observacoes": "string com qualquer outra informação relevante"
         }}
-        Se algum campo não for encontrado, use null.
-        Texto:
-        {texto[:5000]}
+        Regras:
+        - Corrija erros óbvios de OCR (ex.: CUTEIM -> CUTRIM, GONCALVES -> GONÇALVES).
+        - Para sexo, use o nome próprio como referência (ex.: IVANETE = F).
+        - Se houver múltiplos vínculos, liste todos.
+        - Se não encontrar um campo, use null.
+        - Se o texto não contiver informações de vínculo, retorne uma lista vazia.
+
+        Texto extraído do PDF:
+        {texto[:6000]}
         """
         payload = {
             "model": LLM_MODEL,
@@ -468,17 +477,26 @@ def extrair_dados_com_ia(texto: str) -> DadosExtraidosIA:
         )
         if response.status_code == 200:
             content = response.json()["choices"][0]["message"]["content"]
-            content = content.strip("`").replace("json", "", 1).strip()
+            # Remove crases e a palavra "json" se vierem
+            content = content.strip("`")
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
+
             dados_dict = json.loads(content)
+
+            # Converte vínculos para o modelo Vinculo
             vinculos = []
             for v in dados_dict.get("vinculos", []):
                 vinculos.append(Vinculo(
                     empregador=v.get("empregador"),
                     data_inicio=v.get("data_inicio"),
                     data_fim=v.get("data_fim"),
+                    tipo_filiado=v.get("cargo"),
                     ultima_remuneracao=v.get("remuneracao"),
-                    tipo_filiado=v.get("cargo")
+                    codigo_empregador=v.get("cnpj")
                 ))
+
             return DadosExtraidosIA(
                 nome=dados_dict.get("nome"),
                 cpf=dados_dict.get("cpf"),
@@ -487,7 +505,7 @@ def extrair_dados_com_ia(texto: str) -> DadosExtraidosIA:
                 nome_mae=dados_dict.get("nome_mae"),
                 sexo=dados_dict.get("sexo"),
                 vinculos=vinculos,
-                observacoes="Extração realizada por IA."
+                observacoes=dados_dict.get("observacoes", "Extração realizada por IA.")
             )
         else:
             return DadosExtraidosIA(observacoes=f"Erro na API: {response.status_code}")
