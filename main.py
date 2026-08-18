@@ -13,7 +13,7 @@ from PIL import Image
 import pymupdf  # PyMuPDF
 import requests
 
-app = FastAPI(title="API Previdenciária Completa", version="1.4.1")
+app = FastAPI(title="API Previdenciária Completa", version="1.5.0")
 
 # ========== CONFIGURAÇÃO ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -46,6 +46,22 @@ class DadosPessoais(BaseModel):
     data_nascimento: Optional[str] = None
     nome_mae: Optional[str] = None
     sexo: Optional[str] = None
+
+class DadosExtraidosIA(BaseModel):
+    nome: Optional[str] = None
+    cpf: Optional[str] = None
+    nit: Optional[str] = None
+    data_nascimento: Optional[str] = None
+    nome_mae: Optional[str] = None
+    sexo: Optional[str] = None
+    vinculos: List[Vinculo] = []
+    observacoes: Optional[str] = None
+
+class ExtracaoIAResponse(BaseModel):
+    success: bool
+    error: Optional[str] = None
+    dados: Optional[DadosExtraidosIA] = None
+    texto_bruto: Optional[str] = None
 
 class CnisResponse(BaseModel):
     filename: str
@@ -127,11 +143,10 @@ def extrair_texto_pdf_ocr(caminho_arquivo):
     texto = ""
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     doc = pymupdf.open(caminho_arquivo)
-    # Limita a 10 páginas para evitar timeout
     total_paginas = min(10, len(doc))
     for page_num in range(total_paginas):
         page = doc.load_page(page_num)
-        pix = page.get_pixmap(dpi=150)  # reduzido para acelerar
+        pix = page.get_pixmap(dpi=150)
         img_path = f"temp_page_{page_num}.png"
         pix.save(img_path)
         img = Image.open(img_path)
@@ -407,6 +422,77 @@ def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
             return {"erro": f"Falha na API: {response.status_code}"}
     except Exception as e:
         return {"erro": str(e)}
+
+def extrair_dados_com_ia(texto: str) -> DadosExtraidosIA:
+    if not LLM_API_KEY:
+        return DadosExtraidosIA(observacoes="Chave de IA não configurada.")
+    try:
+        headers = {
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        prompt = f"""
+        Você é um assistente especializado em análise de documentos pessoais brasileiros (RG, CPF, CTPS, CNIS).
+        Extraia do texto abaixo os seguintes campos, se presentes, e retorne APENAS JSON válido:
+        {{
+          "nome": "string",
+          "cpf": "string",
+          "nit": "string",
+          "data_nascimento": "dd/mm/aaaa",
+          "nome_mae": "string",
+          "sexo": "M ou F",
+          "vinculos": [
+            {{
+              "empregador": "string",
+              "data_inicio": "dd/mm/aaaa",
+              "data_fim": "dd/mm/aaaa",
+              "cargo": "string",
+              "remuneracao": "string"
+            }}
+          ]
+        }}
+        Se algum campo não for encontrado, use null.
+        Texto:
+        {texto[:5000]}
+        """
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1
+        }
+        response = requests.post(
+            f"{LLM_API_BASE.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+        if response.status_code == 200:
+            content = response.json()["choices"][0]["message"]["content"]
+            content = content.strip("`").replace("json", "", 1).strip()
+            dados_dict = json.loads(content)
+            vinculos = []
+            for v in dados_dict.get("vinculos", []):
+                vinculos.append(Vinculo(
+                    empregador=v.get("empregador"),
+                    data_inicio=v.get("data_inicio"),
+                    data_fim=v.get("data_fim"),
+                    ultima_remuneracao=v.get("remuneracao"),
+                    tipo_filiado=v.get("cargo")
+                ))
+            return DadosExtraidosIA(
+                nome=dados_dict.get("nome"),
+                cpf=dados_dict.get("cpf"),
+                nit=dados_dict.get("nit"),
+                data_nascimento=dados_dict.get("data_nascimento"),
+                nome_mae=dados_dict.get("nome_mae"),
+                sexo=dados_dict.get("sexo"),
+                vinculos=vinculos,
+                observacoes="Extração realizada por IA."
+            )
+        else:
+            return DadosExtraidosIA(observacoes=f"Erro na API: {response.status_code}")
+    except Exception as e:
+        return DadosExtraidosIA(observacoes=f"Erro: {e}")
 
 # ========== MOTORES DE REGRAS ==========
 def motor_seguro_defeso(dados: Dict[str, Any]) -> AuditoriaResponse:
@@ -770,53 +856,40 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
 
     textos_documentos = []
 
-    # ========== 1. Salvar e extrair texto de TODOS os PDFs ==========
     for file in files:
         if not file.filename.lower().endswith('.pdf'):
             continue
-
-        # Salva em arquivo temporário
         conteudo = await file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
             tmp.write(conteudo)
             caminho_temporario = tmp.name
-
         try:
-            # Tenta extrair texto normal (pdfplumber)
             texto = extrair_texto_pdf(caminho_temporario)
             if not texto:
-                # Fallback para OCR
                 texto = extrair_texto_pdf_ocr(caminho_temporario)
-
             if texto:
                 textos_documentos.append({
                     "filename": file.filename,
                     "texto": texto
                 })
-            else:
-                print(f"⚠️ Nenhum texto extraído de {file.filename}")
         except Exception as e:
-            print(f"❌ Erro ao processar {file.filename}: {e}")
+            print(f"Erro ao processar {file.filename}: {e}")
         finally:
-            # Remove o arquivo temporário
             if os.path.exists(caminho_temporario):
                 os.unlink(caminho_temporario)
 
     if not textos_documentos:
         return ProcessoCompletoResponse(success=False, error="Nenhum texto extraído dos PDFs")
 
-    # ========== 2. Identificar CNIS entre os documentos ==========
     dados_pessoais = None
     vinculos = []
 
     for doc in textos_documentos:
-        # Verifica se é CNIS pelo nome ou pelo conteúdo
         if "cnis" in doc["filename"].lower() or "NIT:" in doc["texto"]:
             dados_pessoais = extrair_dados_pessoais(doc["texto"])
             vinculos = parsear_vinculos_cnis(doc["texto"])
             break
 
-    # ========== 3. Salvar no Supabase (se CNIS encontrado) ==========
     if supabase and dados_pessoais and dados_pessoais.nit:
         try:
             response_seg = supabase.table("segurados").upsert(
@@ -831,9 +904,7 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
             ).execute()
             if response_seg.data:
                 segurado_id = response_seg.data[0]["id"]
-            # Limpa vínculos antigos
             supabase.table("vinculos").delete().eq("nit", dados_pessoais.nit).execute()
-            # Insere novos vínculos
             for v in vinculos:
                 supabase.table("vinculos").insert({
                     "filename": "processo_completo",
@@ -848,9 +919,8 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
                     "indicador": v.indicador
                 }).execute()
         except Exception as e:
-            print(f"Erro ao salvar no Supabase: {e}")
+            print(f"Erro ao salvar: {e}")
 
-    # ========== 4. Cálculo Previdenciário ==========
     calculo_result = None
     sexo_padrao = "M"
     if dados_pessoais and dados_pessoais.nit:
@@ -877,9 +947,7 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         except Exception as e:
             calculo_result = CalculoResponse(success=False, error=str(e))
 
-    # ========== 5. Auditoria ==========
     auditoria_result = None
-    # Combina os textos de todos os documentos (limitado)
     texto_completo = "\n\n".join([f"=== {doc['filename']} ===\n{doc['texto'][:1500]}" for doc in textos_documentos])
     texto_completo = texto_completo[:6000]
     if LLM_API_KEY and texto_completo:
@@ -889,7 +957,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         else:
             auditoria_result = roteador_auditoria(dados_ia)
 
-    # ========== 6. Resposta final ==========
     return ProcessoCompletoResponse(
         success=True,
         dados_pessoais=dados_pessoais,
@@ -898,6 +965,35 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         auditoria=auditoria_result,
         documentos_analisados=[doc["filename"] for doc in textos_documentos],
     )
+
+@app.post("/extrair-dados-ia", response_model=ExtracaoIAResponse)
+async def extrair_dados_ia(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Apenas PDF")
+
+    conteudo = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        tmp.write(conteudo)
+        caminho = tmp.name
+
+    try:
+        texto = extrair_texto_pdf(caminho)
+        if not texto:
+            texto = extrair_texto_pdf_ocr(caminho)
+        if not texto:
+            return ExtracaoIAResponse(success=False, error="Não foi possível extrair texto do PDF.")
+
+        dados = extrair_dados_com_ia(texto)
+        return ExtracaoIAResponse(
+            success=True,
+            dados=dados,
+            texto_bruto=texto[:2000]
+        )
+    except Exception as e:
+        return ExtracaoIAResponse(success=False, error=str(e))
+    finally:
+        if os.path.exists(caminho):
+            os.unlink(caminho)
 
 @app.get("/")
 async def root():
