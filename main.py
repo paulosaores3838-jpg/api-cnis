@@ -127,9 +127,11 @@ def extrair_texto_pdf_ocr(caminho_arquivo):
     texto = ""
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     doc = pymupdf.open(caminho_arquivo)
-    for page_num in range(len(doc)):
+    # Limita a 10 páginas para evitar timeout
+    total_paginas = min(10, len(doc))
+    for page_num in range(total_paginas):
         page = doc.load_page(page_num)
-        pix = page.get_pixmap(dpi=200)  # otimizado
+        pix = page.get_pixmap(dpi=150)  # reduzido para acelerar
         img_path = f"temp_page_{page_num}.png"
         pix.save(img_path)
         img = Image.open(img_path)
