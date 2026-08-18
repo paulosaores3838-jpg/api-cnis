@@ -133,7 +133,7 @@ if btn_analisar:
         status_box.write("🔍 Extraindo dados cadastrais e vínculos (OCR/Parsing)...")
 
         # Timeout aumentado para 300 segundos (5 minutos)
-        resp = requests.post(f"{API_BASE}/analisar-processo-completo", files=files, timeout=300)
+        resp = requests.post(f"{API_BASE}/analisar-processo-completo", files=files, timeout=600)
         progresso.progress(70)
 
         if resp.status_code == 200:
