@@ -14,7 +14,7 @@ from PIL import Image
 import pymupdf  # PyMuPDF
 import requests
 
-app = FastAPI(title="API Previdenciária Completa", version="1.6.0")
+app = FastAPI(title="API Previdenciária Completa", version="1.7.0")
 
 # ========== CONFIGURAÇÃO ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -366,7 +366,10 @@ def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
     try:
         headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
         prompt = f"""
-        Você é um auditor previdenciário sênior. Analise o texto abaixo e retorne JSON com tipo_servico, segurado e dados_especificos.
+        Você é um auditor previdenciário sênior. Analise o texto abaixo e retorne JSON com:
+        - tipo_servico: um dos valores: SEGURO_DEFESO, APOSENTADORIA, AUXILIO_INCAPACIDADE, BPC_LOAS, PENSAO_MORTE, OUTRO
+        - segurado: APENAS o nome do segurado (string)
+        - dados_especificos: um dicionário com os campos mais relevantes.
         Texto:
         {texto[:3000]}
         """
@@ -396,7 +399,7 @@ def extrair_dados_com_ia_imagem(imagens_base64: List[str]) -> DadosExtraidosIA:
                 "type": "text",
                 "text": """
                 Você é um assistente especializado em análise de documentos pessoais e previdenciários brasileiros (RG, CPF, CTPS, CNIS, PIS/PASEP).
-                As imagens abaixo são páginas de um documento escaneado. Extraia TODOS os dados relevantes.
+                As imagens abaixo são páginas de um documento escaneado. Extraia TODOS os dados relevantes, incluindo vínculos empregatícios da CTPS.
                 Retorne APENAS JSON válido no formato:
                 {
                   "nome": "string ou null",
@@ -417,7 +420,7 @@ def extrair_dados_com_ia_imagem(imagens_base64: List[str]) -> DadosExtraidosIA:
                   ],
                   "observacoes": "string com qualquer outra informação relevante"
                 }
-                Corrija erros de OCR.
+                Preste atenção especial a registros de contrato de trabalho, empregador, datas de admissão/demissão, cargo, remuneração e CNPJ.
                 Se não encontrar um campo, use null.
                 """
             }
@@ -625,6 +628,8 @@ def motor_pensao_morte(dados: Dict[str, Any]) -> AuditoriaResponse:
 def roteador_auditoria(dados_ia: Dict[str, Any]) -> AuditoriaResponse:
     tipo = dados_ia.get("tipo_servico", "OUTRO").upper()
     segurado = dados_ia.get("segurado", "Não identificado")
+    if isinstance(segurado, dict):
+        segurado = segurado.get("nome") or "Não identificado"
     especificos = dados_ia.get("dados_especificos", {}) or {}
 
     if tipo == "SEGURO_DEFESO":
@@ -859,10 +864,10 @@ async def extrair_dados_ia(file: UploadFile = File(...)):
     try:
         imagens_base64 = []
         doc = pymupdf.open(caminho)
-        total_paginas = min(3, len(doc))
+        total_paginas = min(5, len(doc))
         for page_num in range(total_paginas):
             page = doc.load_page(page_num)
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=200)
             img_bytes = pix.tobytes("png")
             img_b64 = base64.b64encode(img_bytes).decode("utf-8")
             imagens_base64.append(img_b64)
