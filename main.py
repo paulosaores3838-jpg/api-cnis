@@ -6,6 +6,7 @@ import re
 import tempfile
 import os
 import json
+import base64
 from datetime import datetime, date
 from supabase import create_client, Client
 import pytesseract
@@ -13,7 +14,7 @@ from PIL import Image
 import pymupdf  # PyMuPDF
 import requests
 
-app = FastAPI(title="API Previdenciária Completa", version="1.5.0")
+app = FastAPI(title="API Previdenciária Completa", version="1.6.0")
 
 # ========== CONFIGURAÇÃO ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -143,10 +144,10 @@ def extrair_texto_pdf_ocr(caminho_arquivo):
     texto = ""
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     doc = pymupdf.open(caminho_arquivo)
-    total_paginas = min(10, len(doc))
+    total_paginas = min(5, len(doc))
     for page_num in range(total_paginas):
         page = doc.load_page(page_num)
-        pix = page.get_pixmap(dpi=150)
+        pix = page.get_pixmap(dpi=100)
         img_path = f"temp_page_{page_num}.png"
         pix.save(img_path)
         img = Image.open(img_path)
@@ -344,28 +345,10 @@ def analisar_texto_com_ia(texto: str, tipo_documento: str) -> Dict[str, Any]:
     if not LLM_API_KEY:
         return {"erro": "Chave de API de IA não configurada."}
     try:
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        prompt = f"""
-        Você é um assistente especializado em direito previdenciário brasileiro.
-        Analise o seguinte documento ({tipo_documento}) e extraia os dados relevantes em formato JSON.
-        Documento:
-        {texto[:3000]}
-        Retorne apenas JSON válido.
-        """
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1
-        }
-        response = requests.post(
-            f"{LLM_API_BASE.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
+        headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
+        prompt = f"Analise o documento ({tipo_documento}) e extraia dados relevantes em JSON.\nDocumento:\n{texto[:3000]}"
+        payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+        response = requests.post(f"{LLM_API_BASE.rstrip('/')}/chat/completions", headers=headers, json=payload, timeout=30)
         if response.status_code == 200:
             content = response.json()["choices"][0]["message"]["content"]
             try:
@@ -381,36 +364,14 @@ def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
     if not LLM_API_KEY:
         return {"erro": "Chave de API de IA não configurada."}
     try:
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
         prompt = f"""
-        Você é um auditor previdenciário sênior. Analise o texto abaixo e retorne um JSON com:
-        - tipo_servico: um dos valores: SEGURO_DEFESO, APOSENTADORIA, AUXILIO_INCAPACIDADE, BPC_LOAS, PENSAO_MORTE, OUTRO
-        - segurado: nome do segurado
-        - dados_especificos: um dicionário com os campos mais relevantes para o tipo de serviço identificado.
-        Exemplos de campos por serviço:
-        SEGURO_DEFESO: rgp_data_emissao, rgp_ativo, possui_vinculo_clt, possui_mei, recebe_outro_beneficio, portaria_defeso_vigente
-        APOSENTADORIA: vinculos, tempo_contribuicao_anos, carencia_meses, idade, sexo, indicadores_pendentes
-        AUXILIO_INCAPACIDADE: dii, qualidade_segurado, carencia_meses, laudo_cid, crm_assinatura
-        BPC_LOAS: cadunico_atualizado, renda_per_capita, idade, comprovacao_deficiencia
-        PENSAO_MORTE: qualidade_segurado_obito, relacao_dependencia, data_obito
+        Você é um auditor previdenciário sênior. Analise o texto abaixo e retorne JSON com tipo_servico, segurado e dados_especificos.
         Texto:
         {texto[:3000]}
-        Retorne APENAS JSON válido, sem texto adicional.
         """
-        payload = {
-            "model": LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1
-        }
-        response = requests.post(
-            f"{LLM_API_BASE.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
+        payload = {"model": LLM_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
+        response = requests.post(f"{LLM_API_BASE.rstrip('/')}/chat/completions", headers=headers, json=payload, timeout=30)
         if response.status_code == 200:
             content = response.json()["choices"][0]["message"]["content"]
             try:
@@ -423,61 +384,61 @@ def extrair_dados_auditoria_ia(texto: str) -> Dict[str, Any]:
     except Exception as e:
         return {"erro": str(e)}
 
-def extrair_dados_com_ia(texto: str) -> DadosExtraidosIA:
+def extrair_dados_com_ia_imagem(imagens_base64: List[str]) -> DadosExtraidosIA:
     if not LLM_API_KEY:
         return DadosExtraidosIA(observacoes="Chave de IA não configurada.")
 
     try:
-        headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        prompt = f"""
-        Você é um assistente especializado em análise de documentos pessoais e previdenciários brasileiros (RG, CPF, CTPS, CNIS, PIS/PASEP).
-        Extraia do texto abaixo TODOS os dados relevantes que encontrar, retornando APENAS JSON válido no seguinte formato:
-        {{
-          "nome": "string ou null",
-          "cpf": "string ou null",
-          "nit": "string ou null (pode estar como PIS/PASEP/NIT)",
-          "data_nascimento": "dd/mm/aaaa ou null",
-          "nome_mae": "string ou null",
-          "sexo": "M ou F ou null (inferir pelo nome se necessário)",
-          "vinculos": [
-            {{
-              "empregador": "string",
-              "cnpj": "string ou null",
-              "cargo": "string ou null",
-              "data_inicio": "dd/mm/aaaa ou null",
-              "data_fim": "dd/mm/aaaa ou null",
-              "remuneracao": "string ou null"
-            }}
-          ],
-          "observacoes": "string com qualquer outra informação relevante"
-        }}
-        Regras:
-        - Corrija erros óbvios de OCR (ex.: CUTEIM -> CUTRIM, GONCALVES -> GONÇALVES).
-        - Para sexo, use o nome próprio como referência (ex.: IVANETE = F).
-        - Se houver múltiplos vínculos, liste todos.
-        - Se não encontrar um campo, use null.
-        - Se o texto não contiver informações de vínculo, retorne uma lista vazia.
+        headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
 
-        Texto extraído do PDF:
-        {texto[:6000]}
-        """
+        conteudo_mensagem = [
+            {
+                "type": "text",
+                "text": """
+                Você é um assistente especializado em análise de documentos pessoais e previdenciários brasileiros (RG, CPF, CTPS, CNIS, PIS/PASEP).
+                As imagens abaixo são páginas de um documento escaneado. Extraia TODOS os dados relevantes.
+                Retorne APENAS JSON válido no formato:
+                {
+                  "nome": "string ou null",
+                  "cpf": "string ou null",
+                  "nit": "string ou null (pode estar como PIS/PASEP/NIT)",
+                  "data_nascimento": "dd/mm/aaaa ou null",
+                  "nome_mae": "string ou null",
+                  "sexo": "M ou F ou null (inferir pelo nome)",
+                  "vinculos": [
+                    {
+                      "empregador": "string",
+                      "cnpj": "string ou null",
+                      "cargo": "string ou null",
+                      "data_inicio": "dd/mm/aaaa ou null",
+                      "data_fim": "dd/mm/aaaa ou null",
+                      "remuneracao": "string ou null"
+                    }
+                  ],
+                  "observacoes": "string com qualquer outra informação relevante"
+                }
+                Corrija erros de OCR.
+                Se não encontrar um campo, use null.
+                """
+            }
+        ]
+
+        for img_b64 in imagens_base64:
+            conteudo_mensagem.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+            })
+
         payload = {
             "model": LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": conteudo_mensagem}],
             "temperature": 0.1
         }
-        response = requests.post(
-            f"{LLM_API_BASE.rstrip('/')}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60
-        )
+
+        response = requests.post(f"{LLM_API_BASE.rstrip('/')}/chat/completions", headers=headers, json=payload, timeout=60)
+
         if response.status_code == 200:
             content = response.json()["choices"][0]["message"]["content"]
-            # Remove crases e a palavra "json" se vierem
             content = content.strip("`")
             if content.startswith("json"):
                 content = content[4:]
@@ -485,7 +446,6 @@ def extrair_dados_com_ia(texto: str) -> DadosExtraidosIA:
 
             dados_dict = json.loads(content)
 
-            # Converte vínculos para o modelo Vinculo
             vinculos = []
             for v in dados_dict.get("vinculos", []):
                 vinculos.append(Vinculo(
@@ -505,7 +465,7 @@ def extrair_dados_com_ia(texto: str) -> DadosExtraidosIA:
                 nome_mae=dados_dict.get("nome_mae"),
                 sexo=dados_dict.get("sexo"),
                 vinculos=vinculos,
-                observacoes=dados_dict.get("observacoes", "Extração realizada por IA.")
+                observacoes=dados_dict.get("observacoes", "Extração por IA direta.")
             )
         else:
             return DadosExtraidosIA(observacoes=f"Erro na API: {response.status_code}")
@@ -703,28 +663,17 @@ async def upload_cnis(file: UploadFile = File(...)):
         if not texto:
             texto = extrair_texto_pdf_ocr(caminho)
         if not texto:
-            return CnisResponse(
-                filename=file.filename,
-                success=False,
-                error="Não foi possível extrair texto do PDF (mesmo com OCR)."
-            )
+            return CnisResponse(filename=file.filename, success=False, error="Não foi possível extrair texto do PDF.")
 
         dados_pessoais = extrair_dados_pessoais(texto)
         vinculos = parsear_vinculos_cnis(texto)
-
         saved = False
         segurado_id = None
 
         if supabase:
             try:
                 response_seg = supabase.table("segurados").upsert(
-                    {
-                        "nome": dados_pessoais.nome,
-                        "nit": dados_pessoais.nit,
-                        "cpf": dados_pessoais.cpf,
-                        "data_nascimento": dados_pessoais.data_nascimento,
-                        "nome_mae": dados_pessoais.nome_mae,
-                    },
+                    {"nome": dados_pessoais.nome, "nit": dados_pessoais.nit, "cpf": dados_pessoais.cpf, "data_nascimento": dados_pessoais.data_nascimento, "nome_mae": dados_pessoais.nome_mae},
                     on_conflict="nit"
                 ).execute()
                 if response_seg.data:
@@ -734,34 +683,18 @@ async def upload_cnis(file: UploadFile = File(...)):
                     supabase.table("vinculos").delete().eq("nit", dados_pessoais.nit).execute()
                 for v in vinculos:
                     supabase.table("vinculos").insert({
-                        "filename": file.filename,
-                        "sequencia": v.sequencia,
-                        "nit": v.nit,
-                        "codigo_empregador": v.codigo_empregador,
-                        "empregador": v.empregador,
-                        "data_inicio": v.data_inicio,
-                        "data_fim": v.data_fim,
-                        "tipo_filiado": v.tipo_filiado,
-                        "ultima_remuneracao": v.ultima_remuneracao,
+                        "filename": file.filename, "sequencia": v.sequencia, "nit": v.nit,
+                        "codigo_empregador": v.codigo_empregador, "empregador": v.empregador,
+                        "data_inicio": v.data_inicio, "data_fim": v.data_fim,
+                        "tipo_filiado": v.tipo_filiado, "ultima_remuneracao": v.ultima_remuneracao,
                         "indicador": v.indicador
                     }).execute()
             except Exception as e:
-                print(f"Erro ao salvar no Supabase: {e}")
+                print(f"Erro ao salvar: {e}")
 
-        return CnisResponse(
-            filename=file.filename,
-            success=True,
-            dados_pessoais=dados_pessoais,
-            vinculos=vinculos,
-            saved=saved,
-            segurado_id=segurado_id
-        )
+        return CnisResponse(filename=file.filename, success=True, dados_pessoais=dados_pessoais, vinculos=vinculos, saved=saved, segurado_id=segurado_id)
     except Exception as e:
-        return CnisResponse(
-            filename=file.filename,
-            success=False,
-            error=f"Erro: {str(e)}"
-        )
+        return CnisResponse(filename=file.filename, success=False, error=str(e))
     finally:
         if os.path.exists(caminho):
             os.unlink(caminho)
@@ -770,97 +703,60 @@ async def upload_cnis(file: UploadFile = File(...)):
 async def calcular(request: CalcularRequest):
     if not supabase:
         return CalculoResponse(success=False, error="Supabase não configurado")
-
     nit = request.nit.strip()
     if not nit:
         return CalculoResponse(success=False, error="NIT é obrigatório")
-
     try:
         response_seg = supabase.table("segurados").select("*").eq("nit", nit).execute()
         if not response_seg.data:
             return CalculoResponse(success=False, error="Segurado não encontrado")
-
         segurado = response_seg.data[0]
         sexo = request.sexo or segurado.get("sexo")
         if not sexo or sexo not in ("M", "F"):
-            return CalculoResponse(success=False, error="Sexo não informado. Informe 'M' ou 'F' no corpo da requisição ou atualize o cadastro do segurado.")
-
+            return CalculoResponse(success=False, error="Sexo não informado.")
         response_vin = supabase.table("vinculos").select("*").eq("nit", nit).execute()
         vinculos_data = response_vin.data or []
         lista_vinculos = [Vinculo(**v) for v in vinculos_data if v.get("data_inicio")]
-
         idade = calcular_idade(segurado.get("data_nascimento"))
         total_dias, anos, meses, dias = calcular_tempo(lista_vinculos)
         carencia = calcular_carencia(lista_vinculos)
-
         tempo_anos_total = anos + (meses / 12) + (dias / 365)
         simulacao = simular_aposentadorias(idade, tempo_anos_total, carencia, sexo)
-
-        return CalculoResponse(
-            success=True,
-            idade=idade,
-            tempo_contribuicao_anos=anos,
-            tempo_contribuicao_meses=meses,
-            tempo_contribuicao_dias=dias,
-            carencia_meses=carencia,
-            simulacao=simulacao
-        )
+        return CalculoResponse(success=True, idade=idade, tempo_contribuicao_anos=anos, tempo_contribuicao_meses=meses, tempo_contribuicao_dias=dias, carencia_meses=carencia, simulacao=simulacao)
     except Exception as e:
-        return CalculoResponse(success=False, error=f"Erro ao calcular: {str(e)}")
+        return CalculoResponse(success=False, error=str(e))
 
 @app.post("/analisar-documento", response_model=DocumentoAnaliseResponse)
 async def analisar_documento(request: DocumentoAnaliseRequest):
     if not request.texto_bruto:
         return DocumentoAnaliseResponse(success=False, error="texto_bruto é obrigatório")
-
     resultado_ia = analisar_texto_com_ia(request.texto_bruto, request.tipo_documento or "documento")
-
-    return DocumentoAnaliseResponse(
-        success=True,
-        dados_extraidos=resultado_ia,
-        resumo=resultado_ia.get("resumo", "")
-    )
+    return DocumentoAnaliseResponse(success=True, dados_extraidos=resultado_ia, resumo=resultado_ia.get("resumo", ""))
 
 @app.get("/consultar-processo", response_model=ProcessoConsultaResponse)
 async def consultar_processo(protocolo: str = None, nit: str = None):
     if not protocolo and not nit:
         return ProcessoConsultaResponse(success=False, error="Informe protocolo ou NIT")
-
-    return ProcessoConsultaResponse(
-        success=True,
-        protocolo=protocolo or "S/N",
-        status="EM ANÁLISE",
-        movimentacoes=[
-            {"data": "10/08/2026", "descricao": "Requerimento protocolado"},
-            {"data": "12/08/2026", "descricao": "Documentos anexados"},
-            {"data": "13/08/2026", "descricao": "Em análise pelo INSS"}
-        ],
-        documentos=["Requerimento.pdf", "CNIS.pdf", "Documento_Identidade.pdf"]
-    )
+    return ProcessoConsultaResponse(success=True, protocolo=protocolo or "S/N", status="EM ANÁLISE", movimentacoes=[{"data": "10/08/2026", "descricao": "Requerimento protocolado"}, {"data": "12/08/2026", "descricao": "Documentos anexados"}, {"data": "13/08/2026", "descricao": "Em análise pelo INSS"}], documentos=["Requerimento.pdf", "CNIS.pdf", "Documento_Identidade.pdf"])
 
 @app.post("/auditar-processo", response_model=AuditoriaResponse)
 async def auditar_processo(file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Apenas PDF")
-
     conteudo = await file.read()
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
         tmp.write(conteudo)
         caminho = tmp.name
-
     try:
         texto = extrair_texto_pdf(caminho)
         if not texto:
             texto = extrair_texto_pdf_ocr(caminho)
         if not texto:
-            return AuditoriaResponse(success=False, error="Não foi possível extrair texto do PDF.")
-
+            return AuditoriaResponse(success=False, error="Não foi possível extrair texto.")
         dados_ia = extrair_dados_auditoria_ia(texto)
         if "erro" in dados_ia:
             return AuditoriaResponse(success=False, error=dados_ia["erro"])
-
-        resultado = roteador_auditoria(dados_ia)
-        return resultado
+        return roteador_auditoria(dados_ia)
     except Exception as e:
         return AuditoriaResponse(success=False, error=str(e))
     finally:
@@ -871,9 +767,7 @@ async def auditar_processo(file: UploadFile = File(...)):
 async def analisar_processo_completo(files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="Envie pelo menos um PDF")
-
     textos_documentos = []
-
     for file in files:
         if not file.filename.lower().endswith('.pdf'):
             continue
@@ -886,12 +780,9 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
             if not texto:
                 texto = extrair_texto_pdf_ocr(caminho_temporario)
             if texto:
-                textos_documentos.append({
-                    "filename": file.filename,
-                    "texto": texto
-                })
+                textos_documentos.append({"filename": file.filename, "texto": texto})
         except Exception as e:
-            print(f"Erro ao processar {file.filename}: {e}")
+            print(f"Erro: {e}")
         finally:
             if os.path.exists(caminho_temporario):
                 os.unlink(caminho_temporario)
@@ -901,7 +792,6 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
 
     dados_pessoais = None
     vinculos = []
-
     for doc in textos_documentos:
         if "cnis" in doc["filename"].lower() or "NIT:" in doc["texto"]:
             dados_pessoais = extrair_dados_pessoais(doc["texto"])
@@ -911,13 +801,7 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
     if supabase and dados_pessoais and dados_pessoais.nit:
         try:
             response_seg = supabase.table("segurados").upsert(
-                {
-                    "nome": dados_pessoais.nome,
-                    "nit": dados_pessoais.nit,
-                    "cpf": dados_pessoais.cpf,
-                    "data_nascimento": dados_pessoais.data_nascimento,
-                    "nome_mae": dados_pessoais.nome_mae,
-                },
+                {"nome": dados_pessoais.nome, "nit": dados_pessoais.nit, "cpf": dados_pessoais.cpf, "data_nascimento": dados_pessoais.data_nascimento, "nome_mae": dados_pessoais.nome_mae},
                 on_conflict="nit"
             ).execute()
             if response_seg.data:
@@ -925,15 +809,10 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
             supabase.table("vinculos").delete().eq("nit", dados_pessoais.nit).execute()
             for v in vinculos:
                 supabase.table("vinculos").insert({
-                    "filename": "processo_completo",
-                    "sequencia": v.sequencia,
-                    "nit": v.nit,
-                    "codigo_empregador": v.codigo_empregador,
-                    "empregador": v.empregador,
-                    "data_inicio": v.data_inicio,
-                    "data_fim": v.data_fim,
-                    "tipo_filiado": v.tipo_filiado,
-                    "ultima_remuneracao": v.ultima_remuneracao,
+                    "filename": "processo_completo", "sequencia": v.sequencia, "nit": v.nit,
+                    "codigo_empregador": v.codigo_empregador, "empregador": v.empregador,
+                    "data_inicio": v.data_inicio, "data_fim": v.data_fim,
+                    "tipo_filiado": v.tipo_filiado, "ultima_remuneracao": v.ultima_remuneracao,
                     "indicador": v.indicador
                 }).execute()
         except Exception as e:
@@ -953,15 +832,7 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
             carencia = calcular_carencia(lista_vinculos)
             tempo_anos_total = anos + (meses / 12) + (dias / 365)
             simulacao = simular_aposentadorias(idade, tempo_anos_total, carencia, sexo_padrao)
-            calculo_result = CalculoResponse(
-                success=True,
-                idade=idade,
-                tempo_contribuicao_anos=anos,
-                tempo_contribuicao_meses=meses,
-                tempo_contribuicao_dias=dias,
-                carencia_meses=carencia,
-                simulacao=simulacao
-            )
+            calculo_result = CalculoResponse(success=True, idade=idade, tempo_contribuicao_anos=anos, tempo_contribuicao_meses=meses, tempo_contribuicao_dias=dias, carencia_meses=carencia, simulacao=simulacao)
         except Exception as e:
             calculo_result = CalculoResponse(success=False, error=str(e))
 
@@ -975,38 +846,31 @@ async def analisar_processo_completo(files: List[UploadFile] = File(...)):
         else:
             auditoria_result = roteador_auditoria(dados_ia)
 
-    return ProcessoCompletoResponse(
-        success=True,
-        dados_pessoais=dados_pessoais,
-        vinculos=vinculos,
-        calculo=calculo_result,
-        auditoria=auditoria_result,
-        documentos_analisados=[doc["filename"] for doc in textos_documentos],
-    )
+    return ProcessoCompletoResponse(success=True, dados_pessoais=dados_pessoais, vinculos=vinculos, calculo=calculo_result, auditoria=auditoria_result, documentos_analisados=[doc["filename"] for doc in textos_documentos])
 
 @app.post("/extrair-dados-ia", response_model=ExtracaoIAResponse)
 async def extrair_dados_ia(file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Apenas PDF")
-
     conteudo = await file.read()
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
         tmp.write(conteudo)
         caminho = tmp.name
-
     try:
-        texto = extrair_texto_pdf(caminho)
-        if not texto:
-            texto = extrair_texto_pdf_ocr(caminho)
-        if not texto:
-            return ExtracaoIAResponse(success=False, error="Não foi possível extrair texto do PDF.")
-
-        dados = extrair_dados_com_ia(texto)
-        return ExtracaoIAResponse(
-            success=True,
-            dados=dados,
-            texto_bruto=texto[:2000]
-        )
+        imagens_base64 = []
+        doc = pymupdf.open(caminho)
+        total_paginas = min(3, len(doc))
+        for page_num in range(total_paginas):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+            img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            imagens_base64.append(img_b64)
+        doc.close()
+        if not imagens_base64:
+            return ExtracaoIAResponse(success=False, error="Não foi possível converter o PDF em imagens.")
+        dados = extrair_dados_com_ia_imagem(imagens_base64)
+        return ExtracaoIAResponse(success=True, dados=dados, texto_bruto=None)
     except Exception as e:
         return ExtracaoIAResponse(success=False, error=str(e))
     finally:
